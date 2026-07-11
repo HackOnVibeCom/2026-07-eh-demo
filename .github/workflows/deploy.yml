@@ -1,0 +1,94 @@
+# Авто-деплой на Cloudflare Pages при пуше в main.
+# Цель деплоя = vars.CF_PROJECT_NAME (если задан), иначе имя репо. Пока в орг нет секрета
+# CLOUDFLARE_API_TOKEN — деплой ПРОПУСКАЕТСЯ (workflow зелёный). Токен (Pages:Edit + Zone:DNS:Edit) как
+# org-секрет → деплой оживает: сборка(опц.) → заливка → привязка домена → DNS CNAME → домен Active.
+#
+# ФРЕЙМВОРК-СБОРКА (опционально, класс Vite/CRA/Astro/Next-export): задай repo-переменные
+#   vars.BUILD_CMD   — команда сборки, напр. "npm ci && npm run build"
+#   vars.DEPLOY_DIR  — папка выхлопа для заливки, напр. "dist" / "out" / "build"
+# Заданы → CI ставит Node, билдит и деплоит DEPLOY_DIR. Не заданы → как раньше: pages deploy .
+# (repo-переменные ставит ТОЛЬКО owner — у коллабораторов-участников прав нет; билд-скрипт команды
+#  токена НЕ получает). SSR-фреймворки (Next.js по умолчанию + сервер) статикой не поднять — хостить
+#  на Vercel и линковать (см. docs/dev/github-org-cicd.md).
+name: Deploy to Cloudflare Pages
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+permissions:
+  contents: read
+  deployments: write
+env:
+  CF_ACCOUNT_ID: fa36ce8e651a803962efe3793f9c4b51
+  CF_ZONE_ID: 60a2c82f45b0abccf34c91e51ee91ca8
+  CF_PROJECT: ${{ vars.CF_PROJECT_NAME || github.event.repository.name }}
+  DEPLOY_DIR: ${{ vars.DEPLOY_DIR || '.' }}
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: guard
+        env:
+          TOK: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -n "$TOK" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CLOUDFLARE_API_TOKEN не задан в секретах орг — деплой пропущен (норма до настройки токена)"
+          fi
+      - name: Setup Node (только если задан BUILD_CMD)
+        if: steps.guard.outputs.ok == 'true' && vars.BUILD_CMD != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Build фреймворка (только если задан BUILD_CMD)
+        if: steps.guard.outputs.ok == 'true' && vars.BUILD_CMD != ''
+        # ВАЖНО: тут НЕТ токена в env — билд-скрипт команды не должен иметь доступ к секрету.
+        env:
+          BUILD_CMD: ${{ vars.BUILD_CMD }}
+        run: |
+          echo "::notice::сборка команды: $BUILD_CMD → выхлоп в '${DEPLOY_DIR}'"
+          eval "$BUILD_CMD"
+      - name: Отключаем edge-кэш (хакатон — правки видны сразу)
+        if: steps.guard.outputs.ok == 'true'
+        run: |
+          # _headers пишем в DEPLOY_DIR (после сборки), чтобы Pages его подхватил. no-store -> edge не кэширует.
+          if [ ! -f "${DEPLOY_DIR}/_headers" ]; then
+            printf '/*\n  Cache-Control: no-store\n' > "${DEPLOY_DIR}/_headers"
+            echo "::notice::_headers (Cache-Control: no-store) добавлен в ${DEPLOY_DIR} — edge-кэш выключен"
+          else
+            echo "::notice::_headers уже есть в ${DEPLOY_DIR} — не трогаю (уважаем настройку команды)"
+          fi
+      - name: Deploy to Cloudflare Pages
+        if: steps.guard.outputs.ok == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: fa36ce8e651a803962efe3793f9c4b51
+          command: pages deploy ${{ env.DEPLOY_DIR }} --project-name=${{ env.CF_PROJECT }} --branch=main
+      - name: Attach custom domain
+        if: steps.guard.outputs.ok == 'true'
+        env:
+          TOK: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          DOMAIN="${CF_PROJECT}.hackonvibe.com"
+          curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT}/domains" \
+            -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" \
+            --data "{\"name\":\"${DOMAIN}\"}" | grep -q '"success":true' \
+            && echo "::notice::домен привязан к проекту → https://$DOMAIN" \
+            || echo "::notice::домен уже привязан к проекту (норма при повторном деплое)"
+      - name: Ensure DNS record (CNAME to pages.dev)
+        if: steps.guard.outputs.ok == 'true'
+        env:
+          TOK: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          # Без DNS-записи домен висит в статусе pending. Создаём CNAME <project> -> <project>.pages.dev
+          # в зоне hackonvibe.com (нужен Zone:DNS:Edit в токене). Идемпотентно: повтор -> "уже существует".
+          curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
+            -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" \
+            --data "{\"type\":\"CNAME\",\"name\":\"${CF_PROJECT}\",\"content\":\"${CF_PROJECT}.pages.dev\",\"proxied\":true}" \
+            | grep -q '"success":true' \
+            && echo "::notice::DNS CNAME создан -> ${CF_PROJECT}.hackonvibe.com (домен станет Active)" \
+            || echo "::notice::DNS-запись уже существует (норма) либо нет прав Zone:DNS:Edit в токене"
